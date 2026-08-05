@@ -478,6 +478,46 @@ static bool odl_inline_enabled(void)
     return cached != 0;
 }
 
+/* ODL_VERBS_DIRECT_SEND=1 opts into skipping the bounce malloc+memcpy for
+ * ordinary (non-dmabuf) queued sends below, submitting straight from the
+ * caller's registered buffer instead. Default OFF - this is a new, wider-
+ * reaching path than the existing inline fast path above (which already
+ * proves the same underlying safety property, but only for small single-WR
+ * sends with an empty SQ) and needs its own hardware validation pass before
+ * being trusted as a default.
+ *
+ * Safety argument (see project docs for the full two-source cross-check):
+ * the kernel's ODL_TB5_IOCTL_STREAM_SEND ioctl fully copies the payload via
+ * copy_from_user() into kernel-owned dma_alloc_coherent() memory before the
+ * ioctl returns - the driver never retains or later dereferences the
+ * userspace pointer (msg->data is explicitly NULLed right after the copy).
+ * The TX worker (odl_qp_worker below) only posts the send CQE AFTER
+ * odl_tb5_stream_send() has already returned, so by the time a well-behaved
+ * caller (one that waits for its send completion before reusing/freeing the
+ * buffer, as ibv_post_send's own contract requires) could possibly reuse the
+ * buffer, the kernel has already finished reading it - with or without this
+ * flag's bounce copy in between.
+ *
+ * NOTE: enabling this flag means the "caller may reuse its buffer the
+ * moment we return" comment a few lines below (in odl_post_send) no longer
+ * applies to ordinary sends - the standard non-inline ibv_post_send
+ * contract applies instead: the caller must not modify/free the buffer
+ * until it has observed the matching send completion. */
+static pthread_once_t odl_direct_send_once = PTHREAD_ONCE_INIT;
+static int odl_direct_send_flag;
+
+static void odl_direct_send_init_once(void)
+{
+    const char *e = getenv("ODL_VERBS_DIRECT_SEND");
+    odl_direct_send_flag = (e && e[0] == '1') ? 1 : 0;
+}
+
+static bool odl_direct_send_enabled(void)
+{
+    pthread_once(&odl_direct_send_once, odl_direct_send_init_once);
+    return odl_direct_send_flag != 0;
+}
+
 int odl_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
                    struct ibv_send_wr **bad_wr)
 {
@@ -542,9 +582,12 @@ int odl_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
             void *bounce = NULL;
 
             /* Copy now; the caller may reuse its buffer the moment we return.
-             * dmabuf MRs are zero-copy by definition and are left alone. */
+             * dmabuf MRs are zero-copy by definition and are left alone.
+             * ODL_VERBS_DIRECT_SEND=1 additionally skips this bounce copy for
+             * ordinary MRs too - see odl_direct_send_enabled()'s comment for
+             * the safety argument. Default off. */
             if (odl_lookup_dmabuf_pub(oqp->ctx, wr->sg_list[0].lkey) < 0 &&
-                blen > 0) {
+                blen > 0 && !odl_direct_send_enabled()) {
                 bounce = malloc(blen);
                 if (!bounce) {
                     *bad_wr = wr;
