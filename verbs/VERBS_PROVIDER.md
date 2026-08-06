@@ -72,7 +72,7 @@ LD_LIBRARY_PATH=build/verbs:build/lib \
 | `ibv_reg_dmabuf_mr` | DMA-buf fd passthrough | ✅ (GPU zero-copy) |
 | `ibv_create_cq` | completion ring + eventfd | N/A |
 | `ibv_create_qp` | `odl_tb5_stream_open` | N/A |
-| `ibv_post_send` | enqueue → worker → `stream_send` | ✅ (async) |
+| `ibv_post_send` | persistent queue-slot copy → worker → `stream_send` | ✅ (async; copied before return) |
 | `ibv_post_recv` | `stream_recv` (blocking) | ❌ |
 | `ibv_poll_cq` | dequeue from eventfd ring | N/A |
 | `ibv_modify_qp` | stream state tracking | N/A |
@@ -97,6 +97,43 @@ post struct ibv_wc → CQ ring
     ├── eventfd_write()     ← wakes ibv_get_cq_event()
     └── ibv_poll_cq()       ← drains from CQ ring
 ```
+
+## WC-mapped host send buffers
+
+Some GPU runtimes expose GPU-written host buffers through a write-combined
+mapping. Such memory is efficient for the GPU to write but can be unusually
+slow for the CPU to read with ordinary `memcpy`. On supported x86 CPUs, the
+standalone provider has an opt-in streaming-load copy for this case:
+
+```bash
+export ODL_VERBS_WC_STREAM_COPY=1
+```
+
+The provider copies a short unaligned prefix normally, uses AVX-512 streaming
+loads for every aligned 64-byte line, and copies the final byte tail normally.
+It falls back to `memcpy` when AVX-512 is unavailable or the request contains
+no complete aligned line. DMA-buffer sends and `ODL_VERBS_DIRECT_SEND=1` bypass
+this path.
+
+The setting is off by default. It is intended for synchronized buffers whose
+GPU producer has finished before `ibv_post_send`; it does not make concurrent
+GPU writes safe. Each send-queue slot retains its largest bounce allocation
+until the queue pair is destroyed, avoiding allocation churn at the cost of a
+high-water memory footprint of approximately queue depth times the largest
+request seen in each slot.
+
+When requested, queue-pair teardown writes a JSON summary to stderr:
+
+```json
+{"odl_wc_stream_copy_summary":true,"enabled":true,"stream_calls":11696,"stream_bytes":1241465728,"fallback_calls":0,"fallback_bytes":0}
+```
+
+Treat `"enabled":false` or a missing summary as an invalid optimized trial.
+On two Ryzen AI MAX+ 395 nodes running DS4 tensor parallelism, two reverse-order
+runs measured median prefill at 95.89 t/s off and 138.78 t/s on, and median
+decode at 9.96 t/s off and 11.23 t/s on. Greedy output was byte-identical in
+all four runs. These figures describe that workload and hardware, not a general
+guarantee for ordinary cached host memory.
 
 ## Device Discovery
 

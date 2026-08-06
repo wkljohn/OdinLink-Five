@@ -28,6 +28,84 @@
 #include <errno.h>
 #include <unistd.h>
 #include <poll.h>
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+
+/* ODL_VERBS_WC_STREAM_COPY=1 opts into streaming loads for the provider's
+ * host-memory bounce copy.  GPU-written host-visible memory is commonly
+ * mapped write-combining; ordinary memcpy reads it very slowly on Strix Halo,
+ * while VMOVNTDQA is the architectural load intended for this mapping.
+ *
+ * Default remains the existing memcpy path.  The optimized path is used only
+ * for a runtime AVX-512-capable CPU and any request containing at least one
+ * aligned cache line.  A short unaligned prefix and byte tail use memcpy; a
+ * request without a full aligned line falls back completely, so the full
+ * verbs payload is always copied. */
+static bool odl_wc_stream_copy_requested(void)
+{
+    const char *e = getenv("ODL_VERBS_WC_STREAM_COPY");
+    return e && strcmp(e, "1") == 0;
+}
+
+static bool odl_wc_stream_copy_supported(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    return __builtin_cpu_supports("avx512f") != 0;
+#else
+    return false;
+#endif
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+__attribute__((target("avx512f")))
+static void odl_wc_stream_copy_lines(void *dst, const void *src, size_t bytes)
+{
+    const char *s = src;
+    char *d = dst;
+    size_t lines = bytes / 64;
+
+    for (size_t i = 0; i < lines; i++) {
+        /* GCC's intrinsic has a historical non-const parameter even though
+         * VMOVNTDQA only reads it.  Cast through uintptr_t to satisfy that
+         * signature without weakening our source pointer elsewhere. */
+        __m512i v = _mm512_stream_load_si512(
+            (void *)(uintptr_t)(s + i * 64));
+        _mm512_storeu_si512((void *)(d + i * 64), v);
+    }
+}
+#endif
+
+/* Returns the number of bytes read with streaming loads, or zero when the
+ * whole request should use memcpy.  For an unaligned source, copy at most one
+ * short prefix to reach the next cache-line boundary, stream the aligned body,
+ * then copy the byte tail. */
+static size_t odl_wc_stream_copy(void *dst, const void *src, size_t bytes)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    size_t misalignment = (uintptr_t)src & 63u;
+    size_t prefix = misalignment ? 64u - misalignment : 0;
+
+    if (bytes >= prefix + 64) {
+        size_t body = (bytes - prefix) & ~(size_t)63;
+        size_t tail = bytes - prefix - body;
+
+        if (prefix)
+            memcpy(dst, src, prefix);
+        odl_wc_stream_copy_lines((char *)dst + prefix,
+                                 (const char *)src + prefix, body);
+        if (tail)
+            memcpy((char *)dst + prefix + body,
+                   (const char *)src + prefix + body, tail);
+        return body;
+    }
+#else
+    (void)dst;
+    (void)src;
+    (void)bytes;
+#endif
+    return 0;
+}
 
 /* ── Worker Thread ──────────────────────────────────────────────────── */
 
@@ -117,7 +195,6 @@ static void *odl_qp_worker(void *arg)
 
     while (qp->worker_running) {
         bool     have_wr = false;
-        void    *w_bounce = NULL;
         uint64_t w_wr_id = 0, w_addr = 0;
         uint32_t w_len = 0, w_lkey = 0;
         int      w_num_sge = 0;
@@ -133,7 +210,6 @@ static void *odl_qp_worker(void *arg)
             w_len     = entry->len;
             w_lkey    = entry->lkey;
             w_num_sge = entry->num_sge;
-            w_bounce  = entry->bounce;
             qp->tx_inflight = true;
             have_wr = true;
         }
@@ -218,10 +294,10 @@ static void *odl_qp_worker(void *arg)
             wc.qp_num   = qp->base.qp_num;
         }
 
-        free(w_bounce);
-
+        /* NOTE: no free() here - the bounce buffer is now persistent,
+         * per-slot storage (entry->bounce_storage) reused across sends on
+         * this slot, not a per-send allocation. Freed only at QP teardown. */
         pthread_mutex_lock(&qp->sq_lock);
-        qp->sq[qp->sq_head].bounce = NULL;
         qp->sq_head = (qp->sq_head + 1) % qp->sq_depth;
         qp->sq_count--;
         qp->tx_inflight = false;      /* on the wire; ordering barrier lifted */
@@ -326,6 +402,13 @@ struct ibv_qp *odl_create_qp(struct ibv_pd *pd,
 
     atomic_init(&qp->pending_sends, 0);
     atomic_init(&qp->pending_recvs, 0);
+    qp->wc_stream_copy_requested = odl_wc_stream_copy_requested();
+    qp->wc_stream_copy_enabled = qp->wc_stream_copy_requested &&
+                                 odl_wc_stream_copy_supported();
+    atomic_init(&qp->wc_stream_copy_calls, 0);
+    atomic_init(&qp->wc_stream_copy_bytes, 0);
+    atomic_init(&qp->wc_stream_fallback_calls, 0);
+    atomic_init(&qp->wc_stream_fallback_bytes, 0);
 
     /* Track in context */
     pthread_mutex_lock(&ctx->qp_lock);
@@ -404,13 +487,22 @@ int odl_destroy_qp(struct ibv_qp *qp)
     if (oqp->stream_id > 0)
         odl_tb5_stream_close(ctx->handle, oqp->stream_id);
 
-    /* Release bounce buffers for work requests never transmitted. */
+    /* Drop any work requests never transmitted (their bounce data, if any,
+     * lives in the slot's persistent bounce_storage - freed below alongside
+     * every other slot's, occupied or not). */
     pthread_mutex_lock(&oqp->sq_lock);
     while (oqp->sq_count > 0) {
-        free(oqp->sq[oqp->sq_head].bounce);
-        oqp->sq[oqp->sq_head].bounce = NULL;
         oqp->sq_head = (oqp->sq_head + 1) % oqp->sq_depth;
         oqp->sq_count--;
+    }
+    /* Release every slot's persistent bounce storage - allocated lazily on
+     * first use and reused across sends since, so a slot may hold storage
+     * here even though it isn't currently occupied. */
+    for (int i = 0; i < oqp->sq_depth; i++) {
+        free(oqp->sq[i].bounce_storage);
+        oqp->sq[i].bounce_storage = NULL;
+        oqp->sq[i].bounce_cap = 0;
+        oqp->sq[i].bounce = NULL;
     }
     pthread_mutex_unlock(&oqp->sq_lock);
 
@@ -425,6 +517,18 @@ int odl_destroy_qp(struct ibv_qp *qp)
     pthread_mutex_unlock(&ctx->qp_lock);
 
     uint8_t stream_id = oqp->stream_id;
+    if (oqp->wc_stream_copy_requested) {
+        fprintf(stderr,
+                "{\"odl_wc_stream_copy_summary\":true,"
+                "\"enabled\":%s,"
+                "\"stream_calls\":%llu,\"stream_bytes\":%llu,"
+                "\"fallback_calls\":%llu,\"fallback_bytes\":%llu}\n",
+                oqp->wc_stream_copy_enabled ? "true" : "false",
+                (unsigned long long)atomic_load(&oqp->wc_stream_copy_calls),
+                (unsigned long long)atomic_load(&oqp->wc_stream_copy_bytes),
+                (unsigned long long)atomic_load(&oqp->wc_stream_fallback_calls),
+                (unsigned long long)atomic_load(&oqp->wc_stream_fallback_bytes));
+    }
     pthread_mutex_destroy(&oqp->sq_lock);
     free(oqp->sq);
     free(oqp);
@@ -585,18 +689,47 @@ int odl_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
              * dmabuf MRs are zero-copy by definition and are left alone.
              * ODL_VERBS_DIRECT_SEND=1 additionally skips this bounce copy for
              * ordinary MRs too - see odl_direct_send_enabled()'s comment for
-             * the safety argument. Default off. */
+             * the safety argument. Default off.
+             *
+             * Reuses this SQ slot's persistent bounce_storage instead of a
+             * fresh malloc()/free() every send: a real production TP
+             * gate-exchange round posts up to ~32 linked WRs while holding
+             * this lock, and per-WR malloc/free was suspected (and later
+             * measured) to add real overhead beyond the underlying memory
+             * read cost. Growing via realloc is safe - a slot's storage
+             * cannot be touched by the worker until this same slot's prior
+             * occupant has fully completed (sq_count/sq_head enforce that),
+             * so there is never a live reader of the old allocation when we
+             * grow it here on the producer side. */
             if (odl_lookup_dmabuf_pub(oqp->ctx, wr->sg_list[0].lkey) < 0 &&
                 blen > 0 && !odl_direct_send_enabled()) {
-                bounce = malloc(blen);
-                if (!bounce) {
-                    *bad_wr = wr;
-                    pthread_mutex_unlock(&oqp->sq_lock);
-                    odl_logerr("post_send: bounce alloc %u failed", blen);
-                    return -ENOMEM;
+                if (entry->bounce_cap < blen) {
+                    void *grown = realloc(entry->bounce_storage, blen);
+                    if (!grown) {
+                        *bad_wr = wr;
+                        pthread_mutex_unlock(&oqp->sq_lock);
+                        odl_logerr("post_send: bounce alloc %u failed", blen);
+                        return -ENOMEM;
+                    }
+                    entry->bounce_storage = grown;
+                    entry->bounce_cap = blen;
                 }
-                memcpy(bounce, (const void *)(uintptr_t)wr->sg_list[0].addr,
-                       blen);
+                bounce = entry->bounce_storage;
+                const void *src =
+                    (const void *)(uintptr_t)wr->sg_list[0].addr;
+                size_t stream_bytes = 0;
+                if (oqp->wc_stream_copy_enabled)
+                    stream_bytes = odl_wc_stream_copy(bounce, src, blen);
+                if (stream_bytes > 0) {
+                    atomic_fetch_add(&oqp->wc_stream_copy_calls, 1);
+                    atomic_fetch_add(&oqp->wc_stream_copy_bytes, stream_bytes);
+                } else {
+                    memcpy(bounce, src, blen);
+                    if (oqp->wc_stream_copy_enabled) {
+                        atomic_fetch_add(&oqp->wc_stream_fallback_calls, 1);
+                        atomic_fetch_add(&oqp->wc_stream_fallback_bytes, blen);
+                    }
+                }
             }
             entry->bounce = bounce;
             entry->addr = bounce ? (uint64_t)(uintptr_t)bounce

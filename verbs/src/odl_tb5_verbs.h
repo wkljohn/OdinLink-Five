@@ -163,7 +163,17 @@ struct odl_verbs_send_entry {
     uint32_t len;
     uint32_t lkey;
     int      num_sge;
-    void    *bounce;
+    void    *bounce;         /* address in use for the CURRENT in-flight
+                               * send, or NULL - points into bounce_storage
+                               * when a copy was made this round. */
+    /* Persistent, per-slot bounce allocation, reused across every send that
+     * lands on this SQ slot instead of malloc+free per send. Grows (never
+     * shrinks) via realloc as needed; freed only at QP teardown. Safe to
+     * reuse across rounds because a slot cannot be reissued until its prior
+     * occupant's send has completed (sq_count/sq_head bookkeeping already
+     * enforces this). */
+    void    *bounce_storage;
+    size_t   bounce_cap;
 };
 
 struct odl_verbs_qp {
@@ -239,6 +249,17 @@ struct odl_verbs_qp {
     /* Async tracking */
     atomic_int                pending_sends;
     atomic_int                pending_recvs;
+
+    /* Opt-in WC-memory copy experiment.  Kept per QP so the normal path is
+     * only one predictable false branch and teardown can report exactly how
+     * much traffic used the streaming-load path versus the safe memcpy
+     * fallback. */
+    bool                      wc_stream_copy_requested;
+    bool                      wc_stream_copy_enabled;
+    atomic_ullong             wc_stream_copy_calls;
+    atomic_ullong             wc_stream_copy_bytes;
+    atomic_ullong             wc_stream_fallback_calls;
+    atomic_ullong             wc_stream_fallback_bytes;
 };
 
 /* ── Context (per-device-open state) ────────────────────────────────── */
