@@ -628,7 +628,20 @@ static void odl_tb5_verify_work_fn(struct work_struct *work)
 
 out_reset:
 	hrtimer_cancel(&dev->rx_poll_timer);
-	odl_tb5_rings_reset(dev);
+
+	/*
+	 * A ring-only reset leaves the connection in CONNECTED with the old
+	 * Thunderbolt paths and hop allocation still installed. Nothing then
+	 * retries verification, and a later module unload may fail to deactivate
+	 * the stale hop. Hand recovery to the serialized restart worker instead.
+	 * It runs only after this verify worker returns, so it can stop the rings,
+	 * release the hop, and begin a clean login without self-deadlocking here.
+	 */
+	if (!atomic_read(&dev->removing) &&
+	    READ_ONCE(dev->state) == ODL_TB5_STATE_CONNECTED) {
+		pr_warn("OdinLink: verification failed; restarting connection cleanly\n");
+		schedule_work(&dev->restart_work);
+	}
 }
 
 /* Tear down stale connection and restart the handshake. */
@@ -645,11 +658,15 @@ static void odl_tb5_restart_work_fn(struct work_struct *work)
 	dev->pong_received = false;
 
 	if (dev->tx.started) {
-		tb_xdomain_disable_paths(dev->xd,
-					 dev->local_tx_hopid,
-					 dev->tx.ring->hop,
-					 dev->stale_remote_tx_hopid,
-					 dev->rx.ring->hop);
+		/* in_hopid is the exact peer hop allocated for the currently
+		 * enabled path. stale_remote_tx_hopid is not initialized when a
+		 * local verification failure triggers this restart. */
+		if (dev->in_hopid_valid)
+			tb_xdomain_disable_paths(dev->xd,
+						 dev->local_tx_hopid,
+						 dev->tx.ring->hop,
+						 dev->in_hopid,
+						 dev->rx.ring->hop);
 		odl_tb5_rings_stop(dev);
 		if (dev->in_hopid_valid) {
 			tb_xdomain_release_in_hopid(dev->xd, dev->in_hopid);

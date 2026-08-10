@@ -192,7 +192,13 @@ struct odl_tb5_tx_msg {
 	size_t			len;
 	size_t			sent;
 	atomic_t		frames_pending;
+	/* The sender owns one reference and all queued completions share one.
+	 * This avoids a reference-count operation for every 4 KiB frame while
+	 * still keeping the message alive until submission and callbacks finish. */
+	refcount_t		refs;
+	atomic_t		completion_ref;
 	bool			done;
+	bool			failed;
 	struct odl_tb5_stream	*stream;
 };
 

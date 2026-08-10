@@ -20,6 +20,11 @@ LIST_HEAD(odl_tb5_devices_list);
 DEFINE_MUTEX(odl_tb5_devices_lock);
 
 static DEFINE_IDA(odl_tb5_ida);
+/* A service remove can mean either "OdinLink is unloading" or "the
+ * Thunderbolt core is already tearing the controller down". Only the former
+ * may initiate path disable; doing it recursively from PCI/core removal can
+ * deadlock with thunderbolt_net's disconnect worker. */
+static bool odl_module_exiting;
 
 unsigned int odl_ring_size = ODL_TB5_RING_SIZE_DEFAULT;
 module_param(odl_ring_size, uint, 0444);
@@ -229,7 +234,24 @@ static void odl_tb5_remove(struct tb_service *svc)
 	cancel_delayed_work_sync(&dev->login_work);
 	cancel_work_sync(&dev->tx_drain_work);
 
+	/* During an explicit OdinLink module exit the XDomain is still alive, so
+	 * disable our paths while every hop and ring identifier remains valid.
+	 * During PCI/cable/core removal, the Thunderbolt core owns path teardown;
+	 * calling back into it here can recurse on its connection mutex. */
+	if (READ_ONCE(odl_module_exiting) && dev->in_hopid_valid &&
+	    dev->tx.ring && dev->rx.ring) {
+		tb_xdomain_disable_paths(dev->xd,
+					 dev->local_tx_hopid,
+					 dev->tx.ring->hop,
+					 dev->in_hopid,
+					 dev->rx.ring->hop);
+	}
+
 	odl_tb5_rings_stop(dev);
+	if (dev->in_hopid_valid) {
+		tb_xdomain_release_in_hopid(dev->xd, dev->in_hopid);
+		dev->in_hopid_valid = false;
+	}
 
 	synchronize_rcu();
 
@@ -244,21 +266,6 @@ static void odl_tb5_remove(struct tb_service *svc)
 	odl_tb5_batch_pool_free(dev);
 	odl_tb5_dma_bufs_free(dev);
 	odl_tb5_rings_free(dev);
-
-	/* BUG1 fix: release regardless of connection state.  The original code
-	 * released only from CONNECTED/READY, so removal during HANDSHAKE
-	 * (login retrying, peer gone, admin unbind) leaked the hop-ID until
-	 * enable_paths returned -ENOMEM on every later load.  Ordering is kept
-	 * exactly as upstream: this runs AFTER rings_stop()/bufs_free() above. */
-	if (dev->in_hopid_valid) {
-		tb_xdomain_disable_paths(dev->xd,
-					 dev->local_tx_hopid,
-					 dev->tx.ring ? dev->tx.ring->hop : -1,
-					 dev->in_hopid,
-					 dev->rx.ring ? dev->rx.ring->hop : -1);
-		tb_xdomain_release_in_hopid(dev->xd, dev->in_hopid);
-		dev->in_hopid_valid = false;
-	}
 
 	odl_tb5_chardev_destroy(dev);
 
@@ -418,7 +425,9 @@ static void __exit odl_tb5_exit(void)
 		goto out;
 	}
 
-	/* Unregister first so tb core removes bound services before orphan cleanup. */
+	/* Tell remove() this is a driver-initiated shutdown, not recursive
+	 * controller removal, before unregistering the services synchronously. */
+	WRITE_ONCE(odl_module_exiting, true);
 	tb_unregister_service_driver(&odl_tb5_driver);
 
 	mutex_lock(&odl_tb5_devices_lock);
@@ -433,7 +442,17 @@ static void __exit odl_tb5_exit(void)
 		cancel_work_sync(&dev->connect_work);
 		cancel_delayed_work_sync(&dev->login_work);
 		cancel_work_sync(&dev->tx_drain_work);
+		if (dev->in_hopid_valid && dev->tx.ring && dev->rx.ring)
+			tb_xdomain_disable_paths(dev->xd,
+						 dev->local_tx_hopid,
+						 dev->tx.ring->hop,
+						 dev->in_hopid,
+						 dev->rx.ring->hop);
 		odl_tb5_rings_stop(dev);
+		if (dev->in_hopid_valid) {
+			tb_xdomain_release_in_hopid(dev->xd, dev->in_hopid);
+			dev->in_hopid_valid = false;
+		}
 		synchronize_rcu();
 		odl_tb5_streams_destroy_all(dev);
 		ida_destroy(&dev->stream_ida);

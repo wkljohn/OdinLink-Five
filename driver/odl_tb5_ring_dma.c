@@ -97,6 +97,36 @@ odl_tb5_rx_ring_to_dev(struct tb_ring *ring)
 	return NULL;
 }
 
+/* Release a completed TX message. The sender and all hardware completions
+ * share two references, rather than taking one reference per 4 KiB frame.
+ * That keeps teardown safe without adding an atomic operation to every frame
+ * beyond the frames_pending decrement that the data path already performs. */
+static void odl_tb5_tx_msg_put(struct odl_tb5_tx_msg *msg)
+{
+	if (refcount_dec_and_test(&msg->refs)) {
+		struct odl_tb5_stream *stream = msg->stream;
+
+		if (!READ_ONCE(msg->failed))
+			atomic_inc(&stream->tx_completed);
+		atomic_dec(&stream->tx_in_flight);
+		wake_up_interruptible(&stream->tx_waitq);
+		odl_tb5_stream_put(stream);
+		kfree(msg);
+	}
+}
+
+/* Drop the completions' shared reference once submission is finished and the
+ * last queued frame has called back. atomic_xchg makes the producer/last-
+ * callback race exactly-once; the producer reference keeps msg alive while
+ * the producer performs this check. */
+static void odl_tb5_tx_msg_maybe_complete(struct odl_tb5_tx_msg *msg)
+{
+	if (smp_load_acquire(&msg->done) &&
+	    atomic_read(&msg->frames_pending) == 0 &&
+	    atomic_xchg(&msg->completion_ref, 0) == 1)
+		odl_tb5_tx_msg_put(msg);
+}
+
 void odl_tb5_tx_callback(struct tb_ring *ring,
 			 struct ring_frame *frame, bool canceled)
 {
@@ -112,8 +142,6 @@ void odl_tb5_tx_callback(struct tb_ring *ring,
 	/* Check if this is a frame pool slot (new stream path) */
 	dev = container_of(ctx, struct odl_tb5_device, tx);
 
-	if (atomic_read(&dev->removing))
-		return;
 	slot = container_of(frame, struct odl_tb5_frame_slot, frame);
 
 	if (slot >= dev->frame_pool.slots &&
@@ -122,15 +150,10 @@ void odl_tb5_tx_callback(struct tb_ring *ring,
 		odl_tb5_frame_pool_put(&dev->frame_pool, slot);
 
 		if (msg) {
-			if (atomic_dec_and_test(&msg->frames_pending) &&
-			    msg->sent == msg->len) {
-				struct odl_tb5_stream *s = msg->stream;
-
-				atomic_inc(&s->tx_completed);
-				atomic_dec(&s->tx_in_flight);
-				wake_up_interruptible(&s->tx_waitq);
-				kfree(msg);
-			}
+			if (canceled)
+				WRITE_ONCE(msg->failed, true);
+			if (atomic_dec_and_test(&msg->frames_pending))
+				odl_tb5_tx_msg_maybe_complete(msg);
 		}
 
 		if (canceled)
@@ -165,9 +188,6 @@ void odl_tb5_tx_batch_callback(struct tb_ring *ring,
 
 	dev = container_of(ctx, struct odl_tb5_device, tx);
 
-	if (atomic_read(&dev->removing))
-		return;
-
 	/* Identify which batch buffer owns this frame (8 entries max) */
 	for (b = 0; b < ODL_TB5_BATCH_BUF_COUNT; b++) {
 		struct odl_tb5_batch_buf *candidate = &dev->batch_pool.bufs[b];
@@ -183,21 +203,16 @@ void odl_tb5_tx_batch_callback(struct tb_ring *ring,
 		return;
 
 	msg = batch->tx_msg;
+	if (msg && canceled)
+		WRITE_ONCE(msg->failed, true);
 
 	/* Return batch buffer to pool when all its frames complete */
 	if (atomic_dec_and_test(&batch->frames_pending))
 		odl_tb5_batch_pool_put(&dev->batch_pool, batch);
 
 	/* Complete the message when all batches are done */
-	if (msg && atomic_dec_and_test(&msg->frames_pending) &&
-	    msg->sent == msg->len) {
-		struct odl_tb5_stream *s = msg->stream;
-
-		atomic_inc(&s->tx_completed);
-		atomic_dec(&s->tx_in_flight);
-		wake_up_interruptible(&s->tx_waitq);
-		kfree(msg);
-	}
+	if (msg && atomic_dec_and_test(&msg->frames_pending))
+		odl_tb5_tx_msg_maybe_complete(msg);
 }
 
 void odl_tb5_rx_callback(struct tb_ring *ring,
@@ -213,7 +228,11 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
 
 	dev = odl_tb5_rx_ring_to_dev(ring);
 
-	if (!dev || atomic_read(&dev->removing))
+	/* remove() stops the rings before deleting the device from the global
+	 * list and before freeing either pool. Canceled callbacks must therefore
+	 * run far enough to return their slots; dropping them here leaks all
+	 * completion accounting and can strand stream references. */
+	if (!dev)
 		return;
 
 	/* Check if this is a frame pool slot (new stream path) */
@@ -1670,9 +1689,18 @@ static int odl_tb5_stream_send_latency(struct odl_tb5_stream *stream,
 	msg->len = len;
 	msg->sent = 0;
 	atomic_set(&msg->frames_pending, 0);
+	refcount_set(&msg->refs, 2);
+	atomic_set(&msg->completion_ref, 1);
 	msg->done = false;
+	msg->failed = false;
 	msg->stream = stream;
 	INIT_LIST_HEAD(&msg->list);
+	/*
+	 * A ring completion can run after the owning file has closed its
+	 * stream. Keep the stream, including its wait queue, alive until the
+	 * final completion has finished using it.
+	 */
+	kref_get(&stream->refcount);
 
 	atomic_inc(&stream->tx_in_flight);
 
@@ -1736,19 +1764,21 @@ static int odl_tb5_stream_send_latency(struct odl_tb5_stream *stream,
 		}
 	}
 
+	smp_store_release(&msg->done, true);
+	odl_tb5_tx_msg_maybe_complete(msg);
+	odl_tb5_tx_msg_put(msg); /* sender reference */
 	return 0;
 
 wait_pending:
+	WRITE_ONCE(msg->failed, true);
 	if (atomic_read(&msg->frames_pending) > 0) {
 		wait_event_interruptible_timeout(stream->tx_waitq,
 			atomic_read(&msg->frames_pending) == 0,
 			msecs_to_jiffies(1000));
 	}
-	if (atomic_read(&msg->frames_pending) == 0) {
-		atomic_dec(&stream->tx_in_flight);
-		wake_up_interruptible(&stream->tx_waitq);
-		kfree(msg);
-	}
+	smp_store_release(&msg->done, true);
+	odl_tb5_tx_msg_maybe_complete(msg);
+	odl_tb5_tx_msg_put(msg); /* sender reference */
 	return (int)ret;
 }
 
@@ -1781,9 +1811,14 @@ static int odl_tb5_stream_send_throughput(struct odl_tb5_stream *stream,
 	msg->len = len;
 	msg->sent = 0;
 	atomic_set(&msg->frames_pending, 0);
+	refcount_set(&msg->refs, 2);
+	atomic_set(&msg->completion_ref, 1);
 	msg->done = false;
+	msg->failed = false;
 	msg->stream = stream;
 	INIT_LIST_HEAD(&msg->list);
+	/* Paired with the put in the final callback or local error cleanup. */
+	kref_get(&stream->refcount);
 
 	atomic_inc(&stream->tx_in_flight);
 
@@ -1895,19 +1930,21 @@ static int odl_tb5_stream_send_throughput(struct odl_tb5_stream *stream,
 		total_sent += batch_payload;
 	}
 
+	smp_store_release(&msg->done, true);
+	odl_tb5_tx_msg_maybe_complete(msg);
+	odl_tb5_tx_msg_put(msg); /* sender reference */
 	return 0;
 
 wait_pending:
+	WRITE_ONCE(msg->failed, true);
 	if (atomic_read(&msg->frames_pending) > 0) {
 		wait_event_interruptible_timeout(stream->tx_waitq,
 			atomic_read(&msg->frames_pending) == 0,
 			msecs_to_jiffies(1000));
 	}
-	if (atomic_read(&msg->frames_pending) == 0) {
-		atomic_dec(&stream->tx_in_flight);
-		wake_up_interruptible(&stream->tx_waitq);
-		kfree(msg);
-	}
+	smp_store_release(&msg->done, true);
+	odl_tb5_tx_msg_maybe_complete(msg);
+	odl_tb5_tx_msg_put(msg); /* sender reference */
 	return (int)ret;
 }
 
