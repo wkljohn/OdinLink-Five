@@ -2,6 +2,9 @@
 
 **When explaining anything, prefer plain English over jargon.** No "RING_FLAG_E2E" — say "a handshake that keeps packets in order." No "NHI ring" — say "DMA packet slot." Assume the reader knows Linux basics but not Thunderbolt internals. Use analogies. Keep it short.
 
+When a review references an issue or pull request, read
+`docs/agents/issue-tracker.md` before fetching tracker context.
+
 ## Build
 
 ```bash
