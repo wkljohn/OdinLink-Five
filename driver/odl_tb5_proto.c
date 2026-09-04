@@ -154,8 +154,24 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
 			(sizeof(resp) / 4 - XD_HDR_SIZE_DW);
 		resp.xd_hdr.uuid      = odl_tb5_proto_uuid;
 		resp.xd_hdr.type      = ODL_TB5_MSG_LOGIN_RSP;
-		resp.status            = 0;
+		resp.status            = ODL_TB5_LOGIN_STATUS_OK;
 		resp.transmit_path     = dev->local_tx_hopid;
+
+		/*
+		 * Full OdinLink login packets carry a meaningful protocol version.
+		 * Apple compatibility packets have a different/short payload and stay
+		 * on their existing lenient path.
+		 */
+		if (odl_protocol_mode == 0 && size >= sizeof(*pkg) &&
+		    proto_ver != ODL_TB5_PROTOCOL_VER) {
+			pr_err("odl_tb5: peer protocol version %u != local %u; refusing login\n",
+			       proto_ver, ODL_TB5_PROTOCOL_VER);
+			resp.status = ODL_TB5_LOGIN_STATUS_PROTO_MISMATCH;
+			tb_xdomain_response(dev->xd, &resp, sizeof(resp),
+					    TB_CFG_PKG_XDOMAIN_RESP);
+			mutex_unlock(&odl_tb5_devices_lock);
+			return 1;
+		}
 
 		ret = tb_xdomain_response(dev->xd, &resp, sizeof(resp),
 					  TB_CFG_PKG_XDOMAIN_RESP);
@@ -270,9 +286,13 @@ int odl_tb5_proto_send_login(struct odl_tb5_device *dev)
 		return -EPROTO;
 	}
 
-	if (resp.status != 0) {
-		pr_warn("OdinLink: peer rejected login with status %u\n",
-			resp.status);
+	if (resp.status != ODL_TB5_LOGIN_STATUS_OK) {
+		if (resp.status == ODL_TB5_LOGIN_STATUS_PROTO_MISMATCH)
+			pr_err("odl_tb5: peer rejected login: protocol version mismatch (local=%u)\n",
+			       ODL_TB5_PROTOCOL_VER);
+		else
+			pr_err("odl_tb5: peer rejected login with status %u\n",
+			       resp.status);
 		return -ECONNREFUSED;
 	}
 

@@ -41,6 +41,8 @@ These are transport-wide correctness fixes, not AMD-specific fixes; only the dis
 | **Independent send and receive progress** | Two-way traffic no longer stalls because one direction reserves the other's buffers. |
 | **Fragment sequencing** | Sequence gaps report loss and drop damaged messages; they detect loss but do not retransmit. |
 | **Byte-verifying stress test** | `tests/odl_rdma_stress.c` catches truncation, reordering, stale data, and loss in one-way, `--bidir`, and `--latency` runs. |
+| **Fail-closed compatibility** | Mismatched OdinLink wire-protocol versions are rejected before either peer enters `READY`; deploy the same commit on both machines. |
+| **Link diagnosis** | `odl_tb5_cli diag` identifies the first failing USB4, peer-discovery, driver, handshake, or device layer. |
 
 ### Measured results on Strix Halo
 
@@ -109,7 +111,15 @@ build/cli/odl_tb5_cli server -d 0
 # Machine B:
 sudo insmod driver/odl_tb5.ko
 build/cli/odl_tb5_cli client -d 0 -t bandwidth
+
+# Either machine: verify the complete link before starting a workload
+build/cli/odl_tb5_cli diag -v
 ```
+
+Install the same commit on both machines. The driver deliberately refuses a
+peer with an incompatible wire protocol instead of silently entering an unsafe
+`READY` state. If the device does not appear, run `diag` on both machines and
+check the reported first failing layer.
 
 Full install guide → [`docs/INSTALL.md`](docs/INSTALL.md)
 

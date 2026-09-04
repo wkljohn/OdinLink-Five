@@ -700,7 +700,7 @@ int odl_tb5_dma_bufs_alloc(struct odl_tb5_device *dev)
 		dev->tx.bufs[i].size = buf_size;
 		dev->tx.bufs[i].virt = dma_alloc_coherent(dma_dev, buf_size,
 							  &dev->tx.bufs[i].phys,
-							  GFP_KERNEL);
+							  GFP_KERNEL | __GFP_NOWARN);
 		if (!dev->tx.bufs[i].virt) {
 			pr_err("odl_tb5: failed to alloc TX DMA buf %d (%zu bytes)\n",
 			       i, buf_size);
@@ -710,7 +710,7 @@ int odl_tb5_dma_bufs_alloc(struct odl_tb5_device *dev)
 		dev->rx.bufs[i].size = buf_size;
 		dev->rx.bufs[i].virt = dma_alloc_coherent(dma_dev, buf_size,
 							  &dev->rx.bufs[i].phys,
-							  GFP_KERNEL);
+							  GFP_KERNEL | __GFP_NOWARN);
 		if (!dev->rx.bufs[i].virt) {
 			pr_err("odl_tb5: failed to alloc RX DMA buf %d (%zu bytes)\n",
 			       i, buf_size);

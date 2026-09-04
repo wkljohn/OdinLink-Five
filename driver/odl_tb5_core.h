@@ -423,6 +423,10 @@ extern struct list_head odl_tb5_devices_list;
 extern struct mutex     odl_tb5_devices_lock;
 extern unsigned int     odl_ring_size;
 
+/* Read-only operational diagnostics. */
+void odl_tb5_debugfs_init(void);
+void odl_tb5_debugfs_exit(void);
+
 /* ── Service lifecycle ───────────────────────────────────────────────── */
 
 int  odl_tb5_service_init(void);

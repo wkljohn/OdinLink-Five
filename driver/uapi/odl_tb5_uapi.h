@@ -45,7 +45,14 @@ typedef int64_t  __s64;
 
 #define ODL_TB5_PROTOCOL_KEY   "odinlink"
 #define ODL_TB5_PROTOCOL_ID    0x4F4C
-#define ODL_TB5_PROTOCOL_VER   1
+/*
+ * Version 2 is the 8-byte stream header with fragment sequencing. Peers with
+ * a different wire format must fail during login, before applications see a
+ * link that looks healthy but cannot exchange messages.
+ */
+#define ODL_TB5_PROTOCOL_VER   2
+#define ODL_TB5_LOGIN_STATUS_OK             0
+#define ODL_TB5_LOGIN_STATUS_PROTO_MISMATCH 1
 
 /* Apple ThunderboltRDMA protocol — for cross-platform Mac ↔ Linux interop
  * Source: AppleThunderboltRDMA.kext Info.plist IOPropertyMatch Protocol ID

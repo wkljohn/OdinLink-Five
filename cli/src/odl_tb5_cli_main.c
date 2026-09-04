@@ -21,6 +21,7 @@ static void print_usage(const char *prog)
 		"Modes:\n"
 		"  server          Wait for peer and respond to tests\n"
 		"  client          Connect to peer and run tests\n"
+		"  diag            Diagnose link setup and driver state\n"
 		"\n"
 		"Common options:\n"
 		"  -d <N>          Device index (default: 0)\n"
@@ -61,10 +62,10 @@ static void parse_block_sizes(const char *str, struct odl_cli_params *p)
 	snprintf(buf, sizeof(buf), "%s", str);
 	p->num_block_sizes = 0;
 
-	tok = strtok_r(buf, ",", &saveptr);
+	tok = strtok_r(buf, ",/", &saveptr);
 	while (tok && p->num_block_sizes < 16) {
 		p->block_sizes[p->num_block_sizes++] = parse_size(tok);
-		tok = strtok_r(NULL, ",", &saveptr);
+		tok = strtok_r(NULL, ",/", &saveptr);
 	}
 }
 
@@ -121,8 +122,9 @@ int main(int argc, char *argv[])
 	const char *mode = argv[1];
 	bool is_server = (strcmp(mode, "server") == 0);
 	bool is_client = (strcmp(mode, "client") == 0);
+	bool is_diag = (strcmp(mode, "diag") == 0);
 
-	if (!is_server && !is_client) {
+	if (!is_server && !is_client && !is_diag) {
 		fprintf(stderr, "Unknown mode: %s\n", mode);
 		print_usage(argv[0]);
 		return 1;
@@ -205,6 +207,8 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
+	if (is_diag)
+		return odl_cli_run_diag(&params);
 	if (is_server)
 		return odl_cli_run_server(&params);
 	else

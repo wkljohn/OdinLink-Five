@@ -29,17 +29,19 @@ cp driver/odl_tb5_chardev.c     "$SRC_DIR/"
 cp driver/odl_tb5_ring_dma.c    "$SRC_DIR/"
 cp driver/odl_tb5_proto.c       "$SRC_DIR/"
 cp driver/odl_tb5_loopback.c    "$SRC_DIR/"
+cp driver/odl_tb5_debugfs.c     "$SRC_DIR/"
 cp driver/odl_tb5_core.h        "$SRC_DIR/"
 cp driver/Kbuild                "$SRC_DIR/"
 cp driver/Makefile              "$SRC_DIR/"
 cp driver/uapi/odl_tb5_uapi.h   "$SRC_DIR/uapi/"
 
-# Configure dkms.conf with the version
+# Configure every template with the version. Copying the helpers verbatim left
+# @PROJECT_VERSION@ in their paths and made successful installs look broken.
 sed "s/@PROJECT_VERSION@/$PACKAGE_VERSION/g" packaging/dkms.conf > "$SRC_DIR/dkms.conf"
-
-# Copy helper scripts
-cp packaging/dkms-postinst.sh    "$SRC_DIR/"
-cp packaging/dkms-prerm.sh      "$SRC_DIR/"
+sed "s/@PROJECT_VERSION@/$PACKAGE_VERSION/g" \
+    packaging/dkms-postinst.sh > "$SRC_DIR/dkms-postinst.sh"
+sed "s/@PROJECT_VERSION@/$PACKAGE_VERSION/g" \
+    packaging/dkms-prerm.sh > "$SRC_DIR/dkms-prerm.sh"
 chmod +x "$SRC_DIR/dkms-postinst.sh" "$SRC_DIR/dkms-prerm.sh"
 
 # Register with DKMS

@@ -80,6 +80,24 @@ const uuid_t odl_tb5_proto_uuid =
 
 static struct tb_property_dir *odl_tb5_property_dir;
 
+#define ODL_TB5_WAIT_PEER_SEC 15
+
+static void odl_tb5_wait_peer_fn(struct work_struct *work)
+{
+	bool empty;
+
+	mutex_lock(&odl_tb5_devices_lock);
+	empty = list_empty(&odl_tb5_devices_list);
+	mutex_unlock(&odl_tb5_devices_lock);
+	if (!empty)
+		return;
+
+	pr_info("odl_tb5: no peer after %d seconds; /dev/odl_tb5_* appears only after both machines load compatible drivers\n",
+		ODL_TB5_WAIT_PEER_SEC);
+}
+
+static DECLARE_DELAYED_WORK(odl_tb5_wait_peer_work, odl_tb5_wait_peer_fn);
+
 static const struct tb_service_id odl_tb5_ids[] = {
 	{ TB_SERVICE(ODL_TB5_PROTOCOL_KEY, ODL_TB5_PROTOCOL_ID) },
 	{ TB_SERVICE(ODL_TB5_PROTOCOL_KEY_APPLE, ODL_TB5_PROTOCOL_ID_APPLE) },
@@ -352,6 +370,7 @@ static int __init odl_tb5_init(void)
 	ret = odl_tb5_chardev_init();
 	if (ret)
 		return ret;
+	odl_tb5_debugfs_init();
 
 	/* If loopback=1 or more, create software-only devices.
 	 * Loopback devices work without Thunderbolt hardware and
@@ -367,6 +386,7 @@ static int __init odl_tb5_init(void)
 
 	odl_tb5_property_dir = tb_property_create_dir(&odl_tb5_proto_uuid);
 	if (!odl_tb5_property_dir) {
+		pr_err("odl_tb5: failed to create the peer-discovery property directory\n");
 		ret = -ENOMEM;
 		goto err_chardev;
 	}
@@ -400,8 +420,11 @@ static int __init odl_tb5_init(void)
 
 	ret = tb_register_property_dir(protocol_key,
 				       odl_tb5_property_dir);
-	if (ret)
+	if (ret) {
+		pr_err("odl_tb5: peer-discovery registration failed for %s: %d\n",
+		       protocol_key, ret);
 		goto err_dir;
+	}
 
 	/* In Apple mode, also register under OdinLink's original key so we
 	 * can still talk to other OdinLink nodes. Need a separate directory
@@ -427,11 +450,17 @@ static int __init odl_tb5_init(void)
 			goto err_dir;
 	}
 
-	odl_tb5_proto_register();
+	ret = odl_tb5_proto_register();
+	if (ret) {
+		pr_err("odl_tb5: protocol handler registration failed: %d\n", ret);
+		goto err_dir;
+	}
 
 	ret = tb_register_service_driver(&odl_tb5_driver);
 	if (ret)
 		goto err_proto;
+	schedule_delayed_work(&odl_tb5_wait_peer_work,
+			      ODL_TB5_WAIT_PEER_SEC * HZ);
 
 	pr_info("odl_tb5: OdinLink TB5 driver loaded (ring_size=%u)\n",
 		odl_ring_size);
@@ -447,6 +476,7 @@ err_dir:
 	}
 	tb_property_free_dir(odl_tb5_property_dir);
 err_chardev:
+	odl_tb5_debugfs_exit();
 	odl_tb5_chardev_exit();
 	return ret;
 }
@@ -454,6 +484,9 @@ err_chardev:
 static void __exit odl_tb5_exit(void)
 {
 	struct odl_tb5_device *dev, *tmp;
+
+	cancel_delayed_work_sync(&odl_tb5_wait_peer_work);
+	odl_tb5_debugfs_exit();
 
 	/* Clean up software loopback devices first (no NHI/hardware deps) */
 	if (odl_loopback_count > 0) {

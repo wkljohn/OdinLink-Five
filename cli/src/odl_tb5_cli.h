@@ -222,6 +222,7 @@ void odl_stats_print_histogram(const struct odl_stats *stats);
 void odl_stats_write_csv(const struct odl_stats *stats, const char *path);
 
 int odl_cli_run_server(const struct odl_cli_params *params);
+int odl_cli_run_diag(const struct odl_cli_params *params);
 
 int odl_cli_run_client(const struct odl_cli_params *params);
 
