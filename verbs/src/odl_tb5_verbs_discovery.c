@@ -71,43 +71,54 @@ static void odl_resolve_real(void)
 /*
  * Consumers match a GID against the address they bound their TCP socket to.
  * A RoCE v2 GID for IPv4 is the IPv4-mapped IPv6 form: ::ffff:a.b.c.d.
- * Pick the address of the interface carrying the Thunderbolt traffic
- * (ODL_RDMA_GID_IFACE, default bond0), or take it verbatim from
- * ODL_RDMA_GID_IP.
+ * Pick the address of the interface carrying the Thunderbolt traffic. An
+ * explicit ODL_RDMA_GID_IFACE is strict. Without one, prefer the bonded
+ * reference setup and then a direct thunderbolt0 link. ODL_RDMA_GID_IP takes
+ * precedence over both.
  */
 static bool odl_local_ipv4(struct in_addr *out)
 {
     const char *ip_env = getenv("ODL_RDMA_GID_IP");
-    if (ip_env && inet_pton(AF_INET, ip_env, out) == 1)
-        return true;
+    if (ip_env) {
+        if (inet_pton(AF_INET, ip_env, out) != 1)
+            return false;
+        return out->s_addr != htonl(INADDR_ANY);
+    }
 
     const char *want = getenv("ODL_RDMA_GID_IFACE");
-    if (!want) want = "bond0";
+    const char *defaults[] = { "bond0", "thunderbolt0" };
 
     struct ifaddrs *ifa = NULL;
     if (getifaddrs(&ifa) != 0) return false;
 
     bool found = false;
-    for (struct ifaddrs *p = ifa; p; p = p->ifa_next) {
-        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) continue;
-        if (strcmp(p->ifa_name, want) != 0) continue;
-        *out = ((struct sockaddr_in *)p->ifa_addr)->sin_addr;
-        found = true;
-        break;
+    size_t count = want ? 1 : sizeof(defaults) / sizeof(defaults[0]);
+    for (size_t i = 0; i < count && !found; i++) {
+        const char *name = want ? want : defaults[i];
+
+        for (struct ifaddrs *p = ifa; p; p = p->ifa_next) {
+            if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) continue;
+            if (strcmp(p->ifa_name, name) != 0) continue;
+            *out = ((struct sockaddr_in *)p->ifa_addr)->sin_addr;
+            if (out->s_addr == htonl(INADDR_ANY)) continue;
+            found = true;
+            break;
+        }
     }
     freeifaddrs(ifa);
     return found;
 }
 
-static void odl_make_roce_v2_gid(union ibv_gid *gid)
+static bool odl_make_roce_v2_gid(union ibv_gid *gid)
 {
     struct in_addr a;
     memset(gid, 0, sizeof(*gid));
-    if (!odl_local_ipv4(&a)) return;
+    if (!odl_local_ipv4(&a)) return false;
     /* ::ffff:a.b.c.d  */
     gid->raw[10] = 0xff;
     gid->raw[11] = 0xff;
     memcpy(&gid->raw[12], &a.s_addr, 4);
+    return true;
 }
 
 /* ── ibv_get_device_list / free / name ───────────────────────────────── */
@@ -180,7 +191,7 @@ int _ibv_query_gid_ex(struct ibv_context *context, uint32_t port_num,
         if (port_num != 1 || gid_index != 0 || !entry) return ENODATA;
         if (entry_size < sizeof(*entry)) return EINVAL;
         memset(entry, 0, sizeof(*entry));
-        odl_make_roce_v2_gid(&entry->gid);
+        if (!odl_make_roce_v2_gid(&entry->gid)) return ENODATA;
         entry->gid_index    = gid_index;
         entry->port_num     = port_num;
         entry->gid_type     = IBV_GID_TYPE_ROCE_V2;
@@ -208,7 +219,7 @@ int ibv_query_gid(struct ibv_context *context, uint8_t port_num, int index,
 
     if (context && context->device && odl_is_tb5_device(context->device)) {
         if (port_num != 1 || index != 0 || !gid) return ENODATA;
-        odl_make_roce_v2_gid(gid);
+        if (!odl_make_roce_v2_gid(gid)) return ENODATA;
         return 0;
     }
 

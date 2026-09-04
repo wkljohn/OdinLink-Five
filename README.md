@@ -118,8 +118,19 @@ build/cli/odl_tb5_cli diag -v
 
 Install the same commit on both machines. The driver deliberately refuses a
 peer with an incompatible wire protocol instead of silently entering an unsafe
-`READY` state. If the device does not appear, run `diag` on both machines and
-check the reported first failing layer.
+`READY` state. Leave the DMA ring size at its default: if one machine cannot
+allocate the preferred size, both drivers negotiate the smaller working size
+during login. Run `diag -v` on both machines and confirm they report `READY`
+with matching local and peer packet-slot counts before starting a workload.
+If the device does not appear, the same command reports the first failing
+layer.
+
+Without an override, the standalone verbs provider looks for an IPv4 address
+on `bond0` first and `thunderbolt0` second. Set `ODL_RDMA_GID_IFACE` on both
+machines when using a different interface, or `ODL_RDMA_GID_IP` to supply each
+machine's address directly. Explicit values are strict: an invalid address or
+an interface without IPv4 produces no GID rather than silently choosing
+another interface.
 
 Full install guide → [`docs/INSTALL.md`](docs/INSTALL.md)
 
@@ -284,8 +295,8 @@ ibv_devinfo     # should list an odl_tb5 device
 | `e2e=0` | 1 (on) | Disables end-to-end flow control handshake. **Only needed for old TB3 controllers** that choke on E2E. TB4/TB5 leave this alone. |
 | `loopback=1` | 0 (off) | Creates fake devices with no cable — data loops back inside your own machine. For testing without a peer. |
 | `protocol=1` | 0 (OdinLink) | Switches to Apple's protocol ID (0xFA57) so macOS peers can discover OdinLink. For Mac↔Linux only. |
-| `odl_ring_size=1024` | 4096 preferred | Preferred DMA packet slots per ring. The driver keeps 4096 when its coherent buffers allocate, then halves on `ENOMEM` down to `odl_ring_fallback_min`. |
-| `odl_ring_fallback_min=0` | 512 | Minimum automatic fallback depth. Set to 0 for strict testing that must fail instead of reducing ring depth. |
+| `odl_ring_size` | 4096 | Preferred DMA packet slots per ring. Each node halves this on `ENOMEM`, down to `odl_ring_fallback_min`; connected peers then negotiate the smaller working size. |
+| `odl_ring_fallback_min` | 512 | Minimum automatic fallback depth. Set to 0 for strict testing that must fail instead of reducing ring depth. |
 
 ```bash
 # Examples:
@@ -293,7 +304,7 @@ sudo insmod driver/odl_tb5.ko                  # TB4/TB5, default everything
 sudo insmod driver/odl_tb5.ko e2e=0            # old TB3 controller
 sudo insmod driver/odl_tb5.ko loopback=1        # no cable, just testing
 sudo insmod driver/odl_tb5.ko protocol=1        # talk to macOS
-sudo insmod driver/odl_tb5.ko odl_ring_size=1024 # prefer a smaller ring
+sudo insmod driver/odl_tb5.ko odl_ring_size=1024 # deliberately prefer a smaller ring
 ```
 
 ## Debug

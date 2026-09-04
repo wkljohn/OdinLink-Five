@@ -65,7 +65,7 @@ CMake reports which components are enabled:
 # Prefer 4096 entries (16 MB per batch); automatically fall back on ENOMEM
 sudo insmod driver/odl_tb5.ko
 
-# Or load with custom ring size (power of 2, 64-16384)
+# Usually unnecessary: deliberately prefer a custom size (power of 2, 64-16384)
 sudo insmod driver/odl_tb5.ko odl_ring_size=1024
 
 # Strict mode: fail rather than reducing the requested ring depth
@@ -80,11 +80,27 @@ sudo insmod driver/odl_tb5.ko protocol=1
 # Verify
 lsmod | grep odl_tb5
 ls /dev/odl_tb5_*
+build/cli/odl_tb5_cli diag -v
 
 # Install udev rule for persistent permissions
 sudo cp driver/71-odl-tb5.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules
 ```
+
+Use the same OdinLink commit on both machines and normally load the module
+without ring parameters. Each node first selects a size it can allocate; login
+then makes both peers use the smaller selection. Before starting an RDMA
+workload, `diag -v` must report `READY` and matching local and peer packet-slot
+counts on both machines. A protocol-version mismatch is intentional protection
+against pairing this driver with an older build that cannot negotiate the
+size.
+
+Without an override, the standalone verbs provider looks for an IPv4 address
+on `bond0` first, then `thunderbolt0`. For another layout, set
+`ODL_RDMA_GID_IFACE` on both machines, or set each machine's address directly
+with `ODL_RDMA_GID_IP`. Explicit values are strict: a malformed or zero
+address, or an interface without IPv4, produces no GID rather than selecting a
+different interface.
 
 ## Install Verbs Provider Plugin
 
