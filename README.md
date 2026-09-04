@@ -16,7 +16,7 @@ OdinLink turns a Thunderbolt cable into a high-speed RDMA interconnect between m
 
 This is an additive fork of [Geramy/OdinLink-Five](https://github.com/Geramy/OdinLink-Five), crediting upstream rather than claiming superiority or a rewrite.
 It keeps the upstream design and adds focused driver and RDMA verbs fixes found while bringing up real cross-node workloads.
-The `main` branch is based on upstream `ed60505` ([full diff](https://github.com/Geramy/OdinLink-Five/compare/ed60505...wkljohn:main)) and was measured on two AMD Ryzen AI MAX+ 395 systems (Strix Halo, `gfx1151`) running Ubuntu 26.04 and kernel 7.0.0-28.
+The `main` branch is based on upstream `ed60505` ([full diff](https://github.com/Geramy/OdinLink-Five/compare/ed60505...wkljohn:main)) and was measured on two AMD Ryzen AI MAX+ 395 systems (Strix Halo, `gfx1151`) running Ubuntu 26.04 and kernel 7.0.0-30.
 
 ```bash
 git clone https://github.com/wkljohn/OdinLink-Five.git
@@ -89,7 +89,7 @@ write-combined host memory on AVX-512 systems; see the
 
 ```bash
 sudo apt install build-essential cmake linux-headers-$(uname -r) libibverbs-dev rdma-core pkg-config gcc-14
-git clone https://github.com/johndpope/OdinLink-Five.git
+git clone https://github.com/wkljohn/OdinLink-Five.git
 cd OdinLink-Five && mkdir build && cd build
 cmake .. -DBUILD_VERBS=ON && make -j$(nproc) odl_tb5_verbs odl_tb5_verbs_provider
 
@@ -104,11 +104,11 @@ build/verbs/tests/test_verbs_basic
 ```bash
 # Machine A:
 sudo insmod driver/odl_tb5.ko
-build/cli/odl_tb5_cli --server --device 0
+build/cli/odl_tb5_cli server -d 0
 
 # Machine B:
 sudo insmod driver/odl_tb5.ko
-build/cli/odl_tb5_cli --client --device 0 --test bandwidth
+build/cli/odl_tb5_cli client -d 0 -t bandwidth
 ```
 
 Full install guide → [`docs/INSTALL.md`](docs/INSTALL.md)
@@ -255,10 +255,10 @@ Exercises: device discovery, context open, PD/MR/CQ/QP lifecycle, post_send/post
 
 ```bash
 # Machine A:
-build/cli/odl_tb5_cli --server --device 0
+build/cli/odl_tb5_cli server -d 0
 
 # Machine B (wait for server to be ready):
-build/cli/odl_tb5_cli --client --device 0 --test bandwidth
+build/cli/odl_tb5_cli client -d 0 -t bandwidth
 ```
 
 **5. ibv_devinfo discovery**
