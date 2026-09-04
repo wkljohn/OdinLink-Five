@@ -521,11 +521,11 @@ rx_frame_done:
 	wake_up_interruptible(&ctx->waitq);
 }
 
-int odl_tb5_rings_alloc(struct odl_tb5_device *dev)
+int odl_tb5_rings_alloc(struct odl_tb5_device *dev, unsigned int requested_size)
 {
 	struct tb_xdomain *xd = dev->xd;
 	unsigned int sof_mask, eof_mask;
-	unsigned int rs = odl_ring_size;
+	unsigned int rs = requested_size;
 	int ret;
 
 	if (rs < ODL_TB5_RING_SIZE_MIN)

@@ -7,6 +7,7 @@
 | Build fails with unknown GCC flags | GCC is too old. Install version matching kernel (`cat /proc/version`) |
 | Module won't load | Check `dmesg | grep odl_tb5`. Ensure TB5 hardware is present (`lspci | grep Thunderbolt`) |
 | No `/dev/odl_tb5_*` devices | Device appears only when a TB5 peer connects. Check `dmesg` for XDomain events. Use `loopback=1` for no-cable testing |
+| `failed to alloc ... DMA buf` | The preferred coherent buffer did not fit. Current builds retry down to 512 entries and log the selected fallback depth. If every depth fails, check IOMMU/CMA state and DMA32 availability; do not repeatedly live-reload a connected peer. |
 | Permission denied | Install udev rule or `sudo chmod 660 /dev/odl_tb5_*` |
 
 ## Daemon & Tray

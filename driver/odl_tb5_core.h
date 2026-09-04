@@ -430,7 +430,8 @@ void odl_tb5_service_exit(void);
 
 /* ── Ring allocation (NHI level) ─────────────────────────────────────── */
 
-int  odl_tb5_rings_alloc(struct odl_tb5_device *dev);
+int  odl_tb5_rings_alloc(struct odl_tb5_device *dev,
+			 unsigned int requested_size);
 void odl_tb5_rings_free(struct odl_tb5_device *dev);
 int  odl_tb5_rings_start(struct odl_tb5_device *dev);
 void odl_tb5_rings_stop(struct odl_tb5_device *dev);

@@ -62,11 +62,14 @@ CMake reports which components are enabled:
 ## Load the Kernel Module
 
 ```bash
-# Load with default ring size (4096 entries = 16 MB per batch)
+# Prefer 4096 entries (16 MB per batch); automatically fall back on ENOMEM
 sudo insmod driver/odl_tb5.ko
 
 # Or load with custom ring size (power of 2, 64-16384)
-sudo insmod driver/odl_tb5.ko ring_size=16384
+sudo insmod driver/odl_tb5.ko odl_ring_size=1024
+
+# Strict mode: fail rather than reducing the requested ring depth
+sudo insmod driver/odl_tb5.ko odl_ring_fallback_min=0
 
 # Loopback mode (no cable needed)
 sudo insmod driver/odl_tb5.ko loopback=1

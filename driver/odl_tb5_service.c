@@ -31,6 +31,11 @@ module_param(odl_ring_size, uint, 0444);
 MODULE_PARM_DESC(odl_ring_size,
 	"NHI ring entries per direction (power-of-2, default 4096 = 16 MB/batch)");
 
+static unsigned int odl_ring_fallback_min = 512;
+module_param(odl_ring_fallback_min, uint, 0444);
+MODULE_PARM_DESC(odl_ring_fallback_min,
+		 "Minimum fallback ring depth (power-of-2, default 512; 0 disables)");
+
 int odl_loopback_count = 0;
 module_param_named(loopback, odl_loopback_count, int, 0444);
 MODULE_PARM_DESC(loopback,
@@ -93,6 +98,7 @@ static int odl_tb5_probe(struct tb_service *svc,
 		return -ENODEV;
 	}
 	struct odl_tb5_device *dev;
+	unsigned int ring_try;
 	int ret;
 
 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
@@ -137,20 +143,12 @@ static int odl_tb5_probe(struct tb_service *svc,
 
 	atomic_set(&dev->removing, 0);
 
-	/* Adaptive TX mode defaults */
+	/*
+	 * Adaptive TX mode defaults. The watermarks are filled after coherent-DMA
+	 * allocation selects the usable NHI ring depth.
+	 */
 	dev->tx_adaptive.mode = ODL_TB5_TX_LATENCY;
 	dev->tx_adaptive.consecutive_low = 0;
-	/* Watermarks gate the shared frame pool (ODL_TB5_FRAME_POOL_SIZE
-	 * slots), NOT the NHI ring depth.  With large odl_ring_size the raw
-	 * ring*3/4 exceeds the pool, so the adaptive logic can never trip and
-	 * TX flow control is miscalibrated.  Clamp to the usable pool.
-	 * (upstream PR #20) */
-	dev->tx_adaptive.high_watermark =
-		min_t(unsigned int, odl_ring_size * 3 / 4,
-		      ODL_TB5_FRAME_POOL_SIZE - ODL_TB5_TX_POOL_RESERVE);
-	dev->tx_adaptive.low_watermark  =
-		min_t(unsigned int, odl_ring_size / 4,
-		      (ODL_TB5_FRAME_POOL_SIZE - ODL_TB5_TX_POOL_RESERVE) / 2);
 
 	ret = odl_tb5_chardev_create(dev);
 	if (ret) {
@@ -159,19 +157,49 @@ static int odl_tb5_probe(struct tb_service *svc,
 		goto err_free_dev;
 	}
 
-	ret = odl_tb5_rings_alloc(dev);
-	if (ret) {
-		pr_err("odl_tb5: ring alloc failed for index %d: %d\n",
-		       dev->index, ret);
-		goto err_chardev;
+	/*
+	 * With direct DMA (for example amd_iommu=off), a large coherent buffer can
+	 * fail despite abundant total RAM because the physical range is not
+	 * allocatable. Keep the preferred depth first, then retry smaller rings
+	 * before protocol/login starts. This preserves the fast path whenever the
+	 * historical 4096-entry allocation succeeds.
+	 */
+	ring_try = odl_ring_size;
+	for (;;) {
+		ret = odl_tb5_rings_alloc(dev, ring_try);
+		if (!ret)
+			ret = odl_tb5_dma_bufs_alloc(dev);
+		if (!ret)
+			break;
+
+		odl_tb5_rings_free(dev);
+		if (ret != -ENOMEM || !odl_ring_fallback_min ||
+		    ring_try <= odl_ring_fallback_min) {
+			pr_err("odl_tb5: alloc index %d depth %u failed: %d\n",
+			       dev->index, ring_try, ret);
+			goto err_chardev;
+		}
+
+		ring_try = max(ring_try >> 1, odl_ring_fallback_min);
+		pr_warn("odl_tb5: coherent DMA unavailable; retrying ring depth %u\n",
+			ring_try);
 	}
 
-	ret = odl_tb5_dma_bufs_alloc(dev);
-	if (ret) {
-		pr_err("odl_tb5: DMA buf alloc failed for index %d: %d\n",
-		       dev->index, ret);
-		goto err_rings;
-	}
+	if (ring_try != odl_ring_size)
+		pr_warn("odl_tb5: using fallback ring depth %u (requested %u)\n",
+			ring_try, odl_ring_size);
+
+	/*
+	 * Watermarks gate the shared frame pool (ODL_TB5_FRAME_POOL_SIZE
+	 * slots), NOT the NHI ring depth. Clamp to the usable pool and derive
+	 * them from the depth that actually allocated.
+	 */
+	dev->tx_adaptive.high_watermark =
+		min_t(unsigned int, ring_try * 3 / 4,
+		      ODL_TB5_FRAME_POOL_SIZE - ODL_TB5_TX_POOL_RESERVE);
+	dev->tx_adaptive.low_watermark =
+		min_t(unsigned int, ring_try / 4,
+		      (ODL_TB5_FRAME_POOL_SIZE - ODL_TB5_TX_POOL_RESERVE) / 2);
 
 	ret = odl_tb5_proto_init(dev);
 	if (ret) {
@@ -193,7 +221,6 @@ static int odl_tb5_probe(struct tb_service *svc,
 
 err_dma:
 	odl_tb5_dma_bufs_free(dev);
-err_rings:
 	odl_tb5_rings_free(dev);
 err_chardev:
 	odl_tb5_chardev_destroy(dev);
@@ -310,6 +337,15 @@ static int __init odl_tb5_init(void)
 		pr_err("odl_tb5: invalid ring_size=%u (must be power-of-2, %u-%u)\n",
 		       odl_ring_size, ODL_TB5_RING_SIZE_MIN,
 		       ODL_TB5_RING_SIZE_MAX);
+		return -EINVAL;
+	}
+	if (odl_ring_fallback_min &&
+	    (!is_power_of_2(odl_ring_fallback_min) ||
+	     odl_ring_fallback_min < ODL_TB5_RING_SIZE_MIN ||
+	     odl_ring_fallback_min > odl_ring_size)) {
+		pr_err("odl_tb5: invalid fallback %u; expected 0 or pow2 [%u, %u]\n",
+		       odl_ring_fallback_min, ODL_TB5_RING_SIZE_MIN,
+		       odl_ring_size);
 		return -EINVAL;
 	}
 
