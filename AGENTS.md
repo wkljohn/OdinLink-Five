@@ -31,7 +31,7 @@ mkdir build && cd build && cmake .. && make -j$(nproc)
 
 | Component | Path | License |
 |-----------|------|---------|
-| Kernel driver | `driver/odl_tb5.ko` (4 .c files) | **GPL v2** |
+| Kernel driver | `driver/odl_tb5.ko` (6 source .c files) | **GPL v2** |
 | Userspace library | `lib/libodl_tb5.so` | MIT |
 | RCCL plugin (AMD) | `rccl/librccl_net_odl_tb5.so` | MIT |
 | NCCL plugin (NVIDIA) | `nccl/libnccl-net-ODL_TB5.so` | MIT |
@@ -51,7 +51,13 @@ mkdir build && cd build && cmake .. && make -j$(nproc)
 
 ## Module Parameters
 
-`ring_size=4096` (range 64–16384, power of 2, 4 KB per entry). `e2e=1` (default, RING_FLAG_E2E). Pass `e2e=0` for TB3 controllers that don't support end-to-end flow control. `protocol=0` (OdinLink, default) or `1` (Apple/macOS compat).
+`odl_ring_size=4096` is the preferred local DMA packet-slot count (range
+64–16384, power of 2, 4 KB per entry). A node halves it on allocation failure,
+down to `odl_ring_fallback_min=512`; protocol-v3 peers then negotiate the
+smaller selected count. Do not pin both machines to 1024 as a deployment
+workaround. `e2e=1` is the default packet-ordering handshake; pass `e2e=0` only
+for TB3 controllers that do not support it. `protocol=0` selects OdinLink and
+`protocol=1` selects Apple/macOS compatibility mode.
 
 ## Gotchas
 
