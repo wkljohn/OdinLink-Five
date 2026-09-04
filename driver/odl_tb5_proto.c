@@ -21,6 +21,8 @@
 
 #include "odl_tb5_core.h"
 #include <linux/delay.h>
+#include <linux/log2.h>
+#include <linux/minmax.h>
 
 #define ODL_TB5_MSG_LOGIN      1
 #define ODL_TB5_MSG_LOGIN_RSP  2
@@ -49,6 +51,7 @@ struct odl_tb5_login_msg {
 	struct odl_tb5_xd_header xd_hdr;
 	u32 proto_version;
 	u32 transmit_path;
+	/* reserved[0] = selected DMA ring depth; 0 = not advertised (old peer). */
 	u32 reserved[2];
 };
 
@@ -56,8 +59,22 @@ struct odl_tb5_login_response {
 	struct odl_tb5_xd_header xd_hdr;
 	u32 status;
 	u32 transmit_path;
+	/* reserved[0] = selected DMA ring depth; 0 = not advertised (old peer). */
 	u32 reserved[2];
 };
+
+static bool odl_tb5_ring_depth_ok(u32 n)
+{
+	return n && is_power_of_2(n) &&
+	       n >= ODL_TB5_RING_SIZE_MIN && n <= ODL_TB5_RING_SIZE_MAX;
+}
+
+static void odl_tb5_note_peer_ring(struct odl_tb5_device *dev, u32 advertised)
+{
+	if (!odl_tb5_ring_depth_ok(advertised))
+		return;
+	dev->peer_ring_size = advertised;
+}
 
 struct odl_tb5_logout_msg {
 	struct odl_tb5_xd_header xd_hdr;
@@ -136,6 +153,7 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
 		if (size >= sizeof(*pkg)) {
 			remote_tx_hopid = pkg->transmit_path;
 			proto_ver = pkg->proto_version;
+			odl_tb5_note_peer_ring(dev, pkg->reserved[0]);
 		} else if (size >= sizeof(struct odl_tb5_xd_header) + 8) {
 			/* Apple-style: transmit_path at offset 40, version at 44 */
 			const u32 *payload = (const u32 *)(hdr + 1);
@@ -144,8 +162,8 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
 		}
 
 		pr_info("OdinLink: received login from peer "
-			"(version=%u, tx_path=%u, size=%zu)\n",
-			proto_ver, remote_tx_hopid, size);
+			"(version=%u, tx_path=%u, ring=%u, size=%zu)\n",
+			proto_ver, remote_tx_hopid, dev->peer_ring_size, size);
 
 		resp.xd_hdr.route_hi  = upper_32_bits(dev->xd->route);
 		resp.xd_hdr.route_lo  = lower_32_bits(dev->xd->route);
@@ -156,6 +174,7 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
 		resp.xd_hdr.type      = ODL_TB5_MSG_LOGIN_RSP;
 		resp.status            = ODL_TB5_LOGIN_STATUS_OK;
 		resp.transmit_path     = dev->local_tx_hopid;
+		resp.reserved[0]       = dev->tx.ring_size;
 
 		/*
 		 * Full OdinLink login packets carry a meaningful protocol version.
@@ -254,6 +273,7 @@ int odl_tb5_proto_send_login(struct odl_tb5_device *dev)
 			       sizeof(msg));
 	msg.proto_version = ODL_TB5_PROTOCOL_VER;
 	msg.transmit_path = dev->local_tx_hopid;
+	msg.reserved[0] = dev->tx.ring_size;
 
 	ret = tb_xdomain_request(dev->xd, &msg, sizeof(msg),
 				 TB_CFG_PKG_XDOMAIN_REQ,
@@ -297,14 +317,16 @@ int odl_tb5_proto_send_login(struct odl_tb5_device *dev)
 	}
 
 	dev->remote_tx_hopid = resp.transmit_path;
+	odl_tb5_note_peer_ring(dev, resp.reserved[0]);
 login_ok:
+	mutex_lock(&dev->state_lock);
 	dev->login_sent = true;
 	if (dev->login_received && dev->state == ODL_TB5_STATE_HANDSHAKE)
 		need_complete = true;
 	mutex_unlock(&dev->state_lock);
 
-	pr_info("OdinLink: login sent OK, remote_tx_hopid=%d\n",
-		dev->remote_tx_hopid);
+	pr_info("OdinLink: login sent OK, remote_tx_hopid=%d peer_ring=%u\n",
+		dev->remote_tx_hopid, dev->peer_ring_size);
 
 	if (need_complete)
 		schedule_work(&dev->connect_work);
@@ -316,6 +338,33 @@ login_ok:
 static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
 {
 	int ret, i;
+	unsigned int local_ring = dev->tx.ring_size;
+	unsigned int peer_ring = dev->peer_ring_size;
+	unsigned int agreed;
+
+	/*
+	 * Each side picks a local depth it can allocate, then both use the
+	 * smaller advertised value. The larger side shrinks before the DMA
+	 * path is enabled so hop IDs and buffer sizes match.
+	 */
+	if (odl_protocol_mode == 0 && odl_tb5_ring_depth_ok(peer_ring)) {
+		agreed = min(local_ring, peer_ring);
+		if (agreed < local_ring) {
+			ret = odl_tb5_rings_resize(dev, agreed);
+			if (ret)
+				return ret;
+			mutex_lock(&dev->state_lock);
+			dev->login_sent = false;
+			mutex_unlock(&dev->state_lock);
+			schedule_delayed_work(&dev->login_work, 0);
+			return 0;
+		}
+		if (agreed < peer_ring) {
+			pr_info("odl_tb5: waiting for peer to shrink ring depth %u -> %u\n",
+				peer_ring, agreed);
+			return 0;
+		}
+	}
 
 	/* BUG1 fix (re-entry): this function is called again on every handshake
 	 * restart.  Without releasing the hop-ID we already hold, each retry
@@ -699,6 +748,7 @@ static void odl_tb5_restart_work_fn(struct work_struct *work)
 	wake_up_all(&dev->state_waitq);
 	dev->login_sent = false;
 	dev->login_retries = 0;
+	dev->peer_ring_size = 0;
 	mutex_unlock(&dev->state_lock);
 
 	pr_info("OdinLink: connection restarted, beginning handshake\n");
@@ -788,6 +838,7 @@ int odl_tb5_proto_init(struct odl_tb5_device *dev)
 	dev->login_retries  = 0;
 	dev->login_sent     = false;
 	dev->login_received = false;
+	dev->peer_ring_size = 0;
 	dev->pong_received  = false;
 	dev->peer_ping_answered = false;
 

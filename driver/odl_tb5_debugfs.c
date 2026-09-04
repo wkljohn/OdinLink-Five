@@ -29,11 +29,11 @@ static int odl_tb5_status_show(struct seq_file *out, void *unused)
 	mutex_lock(&odl_tb5_devices_lock);
 	list_for_each_entry(dev, &odl_tb5_devices_list, list) {
 		seq_printf(out,
-			   "dev%d: state=%s ring_size=%u login_sent=%d "
+			   "dev%d: state=%s ring_size=%u peer_ring=%u login_sent=%d "
 			   "login_received=%d login_retries=%d dma_verified=%d "
 			   "peer_ping_answered=%d open_count=%d\n",
 			   dev->index, odl_tb5_state_name(dev->state),
-			   dev->tx.ring_size, dev->login_sent,
+			   dev->tx.ring_size, dev->peer_ring_size, dev->login_sent,
 			   dev->login_received, dev->login_retries,
 			   dev->pong_received, dev->peer_ping_answered,
 			   atomic_read(&dev->open_count));
