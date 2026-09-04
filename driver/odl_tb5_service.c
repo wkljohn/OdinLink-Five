@@ -207,18 +207,6 @@ static int odl_tb5_probe(struct tb_service *svc,
 		pr_warn("odl_tb5: using fallback ring depth %u (requested %u)\n",
 			ring_try, odl_ring_size);
 
-	/*
-	 * Watermarks gate the shared frame pool (ODL_TB5_FRAME_POOL_SIZE
-	 * slots), NOT the NHI ring depth. Clamp to the usable pool and derive
-	 * them from the depth that actually allocated.
-	 */
-	dev->tx_adaptive.high_watermark =
-		min_t(unsigned int, ring_try * 3 / 4,
-		      ODL_TB5_FRAME_POOL_SIZE - ODL_TB5_TX_POOL_RESERVE);
-	dev->tx_adaptive.low_watermark =
-		min_t(unsigned int, ring_try / 4,
-		      (ODL_TB5_FRAME_POOL_SIZE - ODL_TB5_TX_POOL_RESERVE) / 2);
-
 	ret = odl_tb5_proto_init(dev);
 	if (ret) {
 		pr_err("odl_tb5: proto init failed for index %d: %d\n",

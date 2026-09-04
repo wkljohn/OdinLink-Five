@@ -313,6 +313,10 @@ struct odl_tb5_device {
 	int			login_retries;
 	bool			login_sent;
 	bool			login_received;
+	bool			connecting;
+	u32			login_generation;
+	/* Peer's selected DMA packet-slot count from login. */
+	unsigned int		peer_ring_size;
 	int			stale_remote_tx_hopid;
 	/* BUG1 fix: authoritative record of the hop-ID actually allocated by
 	 * tb_xdomain_alloc_in_hopid(), so every teardown path can release it
@@ -437,6 +441,8 @@ void odl_tb5_service_exit(void);
 int  odl_tb5_rings_alloc(struct odl_tb5_device *dev,
 			 unsigned int requested_size);
 void odl_tb5_rings_free(struct odl_tb5_device *dev);
+int  odl_tb5_rings_resize(struct odl_tb5_device *dev, unsigned int new_size);
+void odl_tb5_update_tx_watermarks(struct odl_tb5_device *dev);
 int  odl_tb5_rings_start(struct odl_tb5_device *dev);
 void odl_tb5_rings_stop(struct odl_tb5_device *dev);
 void odl_tb5_rings_reset(struct odl_tb5_device *dev);

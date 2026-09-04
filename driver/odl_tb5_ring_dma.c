@@ -600,6 +600,7 @@ int odl_tb5_rings_alloc(struct odl_tb5_device *dev, unsigned int requested_size)
 	atomic_set(&dev->rx.submitted, 0);
 	init_waitqueue_head(&dev->tx.waitq);
 	init_waitqueue_head(&dev->rx.waitq);
+	odl_tb5_update_tx_watermarks(dev);
 
 	return 0;
 
@@ -639,6 +640,50 @@ void odl_tb5_rings_free(struct odl_tb5_device *dev)
 	dev->tx.frames = NULL;
 	kvfree(dev->rx.frames);
 	dev->rx.frames = NULL;
+}
+
+void odl_tb5_update_tx_watermarks(struct odl_tb5_device *dev)
+{
+	unsigned int ring_try = dev->tx.ring_size;
+
+	dev->tx_adaptive.high_watermark =
+		min_t(unsigned int, ring_try * 3 / 4,
+		      ODL_TB5_FRAME_POOL_SIZE - ODL_TB5_TX_POOL_RESERVE);
+	dev->tx_adaptive.low_watermark =
+		min_t(unsigned int, ring_try / 4,
+		      (ODL_TB5_FRAME_POOL_SIZE - ODL_TB5_TX_POOL_RESERVE) / 2);
+}
+
+int odl_tb5_rings_resize(struct odl_tb5_device *dev, unsigned int new_size)
+{
+	unsigned int old = dev->tx.ring_size;
+	int ret;
+
+	if (dev->tx.started || dev->rx.started)
+		return -EBUSY;
+	if (new_size >= old)
+		return 0;
+
+	odl_tb5_dma_bufs_free(dev);
+	odl_tb5_rings_free(dev);
+
+	ret = odl_tb5_rings_alloc(dev, new_size);
+	if (!ret)
+		ret = odl_tb5_dma_bufs_alloc(dev);
+	if (ret) {
+		pr_err("odl_tb5: shrink %u -> %u failed (%d); restoring %u\n",
+		       old, new_size, ret, old);
+		odl_tb5_dma_bufs_free(dev);
+		odl_tb5_rings_free(dev);
+		ret = odl_tb5_rings_alloc(dev, old);
+		if (!ret)
+			ret = odl_tb5_dma_bufs_alloc(dev);
+		return ret ? ret : -ENOMEM;
+	}
+
+	pr_info("odl_tb5: matched peer DMA packet slots %u -> %u\n",
+		old, new_size);
+	return 0;
 }
 
 int odl_tb5_rings_start(struct odl_tb5_device *dev)
