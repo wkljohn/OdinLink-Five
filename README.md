@@ -57,17 +57,17 @@ These two-node measurements used a USB4v1 cable; the driver reported 10 Gb/s × 
 | llama.cpp 27B Q6_K, 2 nodes, `-sm layer`, tg128 | **9.16 t/s** | **9.07 t/s** thunderbolt_ibverbs; **8.83 t/s** TCP |
 | llama.cpp 27B Q6_K, 1 node, tg128 | **9.50 t/s** | Single node |
 | Inline send, 1 KiB | **min −1.93 µs; stddev −52%** | median **22.58 off / 22.50 on** |
-| DS4 DeepSeek V4 Flash Q4_K, 2-node tensor parallel prefill | **138.78 t/s median** | **95.89 t/s** default copy; **+44.7%** with `ODL_VERBS_WC_STREAM_COPY=1` |
-| DS4 DeepSeek V4 Flash Q4_K, 2-node tensor parallel decode | **11.23 t/s median** | **9.96 t/s** default copy; **+12.8%** with `ODL_VERBS_WC_STREAM_COPY=1` |
+| DS4 DeepSeek V4 Flash Q4_K, TP=2 prefill | **270.34 t/s** | Cache-free 2,048-token prefill; exact-fingerprint validation run |
+| DS4 DeepSeek V4 Flash Q4_K, TP=2 decode | **20.52 t/s** | 300 generated tokens; exact fingerprint and zero provider fallback |
 
 The median is reproducible, but p95/p99 are not; the bulk results are byte-verified. A single node at 9.50 t/s remains faster than two nodes, which are for capacity rather than speed.
 
-The DS4 tensor-parallel result used two Ryzen AI MAX+ 395 nodes, identical DS4
-and provider binaries, a 9,881-byte prompt, greedy generation, and two runs per
-arm in reverse order. All four generated outputs were byte-identical. The
-streaming-copy path is still opt-in because it targets GPU-written,
-write-combined host memory on AVX-512 systems; see the
-[verbs provider manual](verbs/VERBS_PROVIDER.md#wc-mapped-host-send-buffers).
+The current DS4 result used two Ryzen AI MAX+ 395 nodes, identical binaries and
+model files, cache-free Q4_K weights, a 2,048-token prefill plus 300-token
+greedy decode, and OdinLink RDMA with no fallback traffic. It matched the
+expected token fingerprint and passed the arithmetic and long-retrieval smoke
+cases. Each rank recorded 61,264 optimized WC sends and 3,849,794,176 bytes;
+see the [verbs provider manual](verbs/VERBS_PROVIDER.md#wc-mapped-host-send-buffers).
 
 ---
 
